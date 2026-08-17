@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from dataclasses import dataclass
+from time import monotonic
 
 import numpy as np
 from numpy.typing import NDArray
@@ -31,7 +32,9 @@ class SimulationConfig:
     background_speed: float = 0.35
     background_ink_rate: float = 40.0
     obstacle: bool = True
-    obstacle_radius_fraction: float = 0.15
+    airfoil_length_fraction: float = 0.24
+    airfoil_thickness_fraction: float = 0.09
+    airfoil_angle_degrees: float = 180.0
 
     def __post_init__(self) -> None:
         if self.grid_size < 8:
@@ -46,8 +49,10 @@ class SimulationConfig:
             raise ValueError("density_decay cannot be negative")
         if self.background_speed < 0.0 or self.background_ink_rate < 0.0:
             raise ValueError("background flow parameters cannot be negative")
-        if not 0.0 <= self.obstacle_radius_fraction < 0.5:
-            raise ValueError("obstacle_radius_fraction must be in [0, 0.5)")
+        if not 0.02 <= self.airfoil_length_fraction < 0.6:
+            raise ValueError("airfoil_length_fraction must be in [0.02, 0.6)")
+        if not 0.01 <= self.airfoil_thickness_fraction < 0.35:
+            raise ValueError("airfoil_thickness_fraction must be in [0.01, 0.35)")
 
 
 class StableFluid2D:
@@ -69,6 +74,9 @@ class StableFluid2D:
         self.v_source = self._zeros()
         self.density = self._zeros()
         self.density_source = self._zeros()
+        self.airfoil_x = (self.n + 1) / 2.0
+        self.airfoil_y = (self.n + 1) / 2.0
+        self.airfoil_angle = np.deg2rad(self.config.airfoil_angle_degrees)
         self.solid = self._make_obstacle_mask()
 
         self._pressure = self._zeros()
@@ -82,14 +90,102 @@ class StableFluid2D:
 
     def _make_obstacle_mask(self) -> NDArray[np.bool_]:
         mask = np.zeros(self.shape, dtype=bool)
-        if not self.config.obstacle or self.config.obstacle_radius_fraction == 0:
+        if not self.config.obstacle:
             return mask
 
-        center = (self.n + 1) / 2.0
-        y, x = np.indices(self.shape)
-        radius = self.n * self.config.obstacle_radius_fraction
-        mask[:] = (x - center) ** 2 + (y - center) ** 2 <= radius**2
+        grid_x, grid_y = np.indices(self.shape)
+        delta_x = grid_x - self.airfoil_x
+        delta_y = grid_y - self.airfoil_y
+        cosine = np.cos(self.airfoil_angle)
+        sine = np.sin(self.airfoil_angle)
+        local_x = cosine * delta_x + sine * delta_y
+        local_y = -sine * delta_x + cosine * delta_y
+
+        length = self.n * self.config.airfoil_length_fraction
+        half_thickness = 0.5 * self.n * self.config.airfoil_thickness_fraction
+        inside_length = (local_x >= -0.5 * length) & (local_x <= 0.5 * length)
+        width_at_x = half_thickness * (0.5 - local_x / length)
+        mask[:] = inside_length & (np.abs(local_y) <= width_at_x)
         return mask
+
+    def airfoil_vertices(self) -> FloatArray:
+        """Return the airfoil triangle vertices in public grid coordinates."""
+
+        length = self.n * self.config.airfoil_length_fraction
+        half_thickness = 0.5 * self.n * self.config.airfoil_thickness_fraction
+        direction = np.array(
+            [np.cos(self.airfoil_angle), np.sin(self.airfoil_angle)]
+        )
+        normal = np.array([-direction[1], direction[0]])
+        center = np.array([self.airfoil_x, self.airfoil_y])
+        nose = center + 0.5 * length * direction
+        rear = center - 0.5 * length * direction
+        return np.vstack(
+            (nose, rear + half_thickness * normal, rear - half_thickness * normal)
+        )
+
+    @staticmethod
+    def _expand_mask(mask: NDArray[np.bool_], layers: int) -> NDArray[np.bool_]:
+        expanded = mask.copy()
+        for _ in range(layers):
+            previous = expanded.copy()
+            expanded[1:, :] |= previous[:-1, :]
+            expanded[:-1, :] |= previous[1:, :]
+            expanded[:, 1:] |= previous[:, :-1]
+            expanded[:, :-1] |= previous[:, 1:]
+        return expanded
+
+    def set_airfoil(
+        self,
+        x: float,
+        y: float,
+        angle: float | None = None,
+        velocity_x: float = 0.0,
+        velocity_y: float = 0.0,
+    ) -> None:
+        """Place the airfoil and transfer its motion to the surrounding fluid.
+
+        Position uses public grid coordinates. Velocity is in domain widths per
+        second, matching the simulation velocity fields.
+        """
+
+        if not self.config.obstacle:
+            return
+        old_solid = self.solid.copy()
+        self.airfoil_x = float(np.clip(x, 1.0, self.n))
+        self.airfoil_y = float(np.clip(y, 1.0, self.n))
+        if angle is not None:
+            self.airfoil_angle = float(angle)
+        self.solid = self._make_obstacle_mask()
+
+        speed = float(np.hypot(velocity_x, velocity_y))
+        max_speed = 2.0
+        if speed > max_speed:
+            scale = max_speed / speed
+            velocity_x *= scale
+            velocity_y *= scale
+
+        boundary_ring = self._expand_mask(self.solid, 3) & ~self.solid
+        vacated_cells = old_solid & ~self.solid
+        affected = boundary_ring | vacated_cells
+        if speed > 0.0 and np.any(affected):
+            coupling = 0.88
+            self.u[affected] = (
+                (1.0 - coupling) * self.u[affected] + coupling * velocity_x
+            )
+            self.v[affected] = (
+                (1.0 - coupling) * self.v[affected] + coupling * velocity_y
+            )
+
+        for field in (
+            self.u,
+            self.v,
+            self.u_source,
+            self.v_source,
+            self.density,
+            self.density_source,
+        ):
+            field[self.solid] = 0.0
 
     def reset(self) -> None:
         """Clear velocity, density, and pending sources."""
@@ -360,22 +456,19 @@ class SwirlApp:
     def __init__(
         self,
         simulation: StableFluid2D,
-        force_scale: float = 120.0,
-        ink_amount: float = 300.0,
-        brush_radius: int = 2,
+        interaction_strength: float = 1.8,
         interval_ms: int = 30,
     ) -> None:
         import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
-        from matplotlib.patches import Circle
+        from matplotlib.patches import Polygon
 
         self.simulation = simulation
-        self.force_scale = force_scale
-        self.ink_amount = ink_amount
-        self.brush_radius = brush_radius
+        self.interaction_strength = interaction_strength
         self.paused = False
+        self._dragging = False
         self._last_mouse: tuple[float, float] | None = None
-        self._button: int | None = None
+        self._last_motion_time: float | None = None
 
         n = simulation.n
         self.figure, (self.density_axis, self.vorticity_axis) = plt.subplots(
@@ -404,16 +497,24 @@ class SwirlApp:
             vmax=1.0,
             interpolation="bilinear",
         )
+        self.airfoil_patches: list[object] = []
         if simulation.config.obstacle:
-            center = n / 2.0
-            radius = n * simulation.config.obstacle_radius_fraction
+            vertices = simulation.airfoil_vertices() - 0.5
             for axis in (self.density_axis, self.vorticity_axis):
-                axis.add_patch(
-                    Circle((center, center), radius, color="black", zorder=3)
+                patch = Polygon(
+                    vertices,
+                    closed=True,
+                    facecolor="#111111",
+                    edgecolor="white",
+                    linewidth=1.2,
+                    zorder=3,
                 )
+                axis.add_patch(patch)
+                self.airfoil_patches.append(patch)
 
         self.figure.suptitle(
-            "Left-drag: ink + force   Right-drag: force   Space: pause   R: reset",
+            "Click-drag: place, aim, and move airfoil   Space: pause   "
+            "R: reset flow   C: center airfoil",
             fontsize=10,
         )
         self.figure.tight_layout()
@@ -429,10 +530,10 @@ class SwirlApp:
             cache_frame_data=False,
         )
 
-    def _grid_coordinate(self, x: float, y: float) -> tuple[int, int]:
+    def _grid_coordinate(self, x: float, y: float) -> tuple[float, float]:
         n = self.simulation.n
-        return int(np.clip(np.floor(x) + 1, 1, n)), int(
-            np.clip(np.floor(y) + 1, 1, n)
+        return float(np.clip(x + 0.5, 1.0, n)), float(
+            np.clip(y + 0.5, 1.0, n)
         )
 
     def _on_press(self, event: object) -> None:
@@ -444,19 +545,19 @@ class SwirlApp:
         x, y = getattr(event, "xdata", None), getattr(event, "ydata", None)
         if x is None or y is None:
             return
+        self._dragging = True
         self._last_mouse = (x, y)
-        raw_button = getattr(event, "button", None)
-        self._button = int(raw_button) if raw_button is not None else None
-        if self._button == 1:
-            i, j = self._grid_coordinate(x, y)
-            self.simulation.add_density(i, j, self.ink_amount, self.brush_radius)
+        self._last_motion_time = monotonic()
+        grid_x, grid_y = self._grid_coordinate(x, y)
+        self.simulation.set_airfoil(grid_x, grid_y)
 
     def _on_release(self, _event: object) -> None:
+        self._dragging = False
         self._last_mouse = None
-        self._button = None
+        self._last_motion_time = None
 
     def _on_motion(self, event: object) -> None:
-        if self._last_mouse is None or self._button is None:
+        if not self._dragging or self._last_mouse is None:
             return
         if getattr(event, "inaxes", None) not in (
             self.density_axis,
@@ -468,18 +569,27 @@ class SwirlApp:
             return
 
         previous_x, previous_y = self._last_mouse
-        i, j = self._grid_coordinate(x, y)
-        scale = self.force_scale / self.simulation.n
-        self.simulation.add_velocity(
-            i,
-            j,
-            scale * (x - previous_x),
-            scale * (y - previous_y),
-            self.brush_radius,
+        delta_x = x - previous_x
+        delta_y = y - previous_y
+        now = monotonic()
+        elapsed = np.clip(now - (self._last_motion_time or now), 1.0 / 240.0, 0.1)
+        distance = float(np.hypot(delta_x, delta_y))
+        angle = (
+            float(np.arctan2(delta_y, delta_x))
+            if distance >= 0.15
+            else self.simulation.airfoil_angle
         )
-        if self._button == 1:
-            self.simulation.add_density(i, j, self.ink_amount, self.brush_radius)
+        velocity_scale = self.interaction_strength / (self.simulation.n * elapsed)
+        grid_x, grid_y = self._grid_coordinate(x, y)
+        self.simulation.set_airfoil(
+            grid_x,
+            grid_y,
+            angle=angle,
+            velocity_x=velocity_scale * delta_x,
+            velocity_y=velocity_scale * delta_y,
+        )
         self._last_mouse = (x, y)
+        self._last_motion_time = now
 
     def _on_key(self, event: object) -> None:
         key = getattr(event, "key", None)
@@ -487,6 +597,10 @@ class SwirlApp:
             self.paused = not self.paused
         elif key and key.lower() == "r":
             self.simulation.reset()
+        elif key and key.lower() == "c":
+            center = (self.simulation.n + 1) / 2.0
+            angle = np.deg2rad(self.simulation.config.airfoil_angle_degrees)
+            self.simulation.set_airfoil(center, center, angle=angle)
 
     def _update(self, _frame: int) -> tuple[object, object]:
         if not self.paused:
@@ -506,6 +620,10 @@ class SwirlApp:
         self.vorticity_image.set_array(vorticity)
         vorticity_max = max(1.0, float(np.percentile(np.abs(vorticity), 99.5)))
         self.vorticity_image.set_clim(-vorticity_max, vorticity_max)
+        if self.airfoil_patches:
+            vertices = self.simulation.airfoil_vertices() - 0.5
+            for patch in self.airfoil_patches:
+                patch.set_xy(vertices)
         return self.density_image, self.vorticity_image
 
     def show(self) -> None:
@@ -526,10 +644,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background-speed", type=float, default=0.35)
     parser.add_argument("--background-ink-rate", type=float, default=40.0)
     parser.add_argument("--no-obstacle", action="store_true")
-    parser.add_argument("--obstacle-radius", type=float, default=0.15)
-    parser.add_argument("--force-scale", type=float, default=120.0)
-    parser.add_argument("--ink-amount", type=float, default=300.0)
-    parser.add_argument("--brush-radius", type=int, default=2)
+    parser.add_argument("--airfoil-length", type=float, default=0.24)
+    parser.add_argument("--airfoil-thickness", type=float, default=0.09)
+    parser.add_argument("--airfoil-angle", type=float, default=180.0)
+    parser.add_argument("--interaction-strength", type=float, default=1.8)
     parser.add_argument(
         "--interval", type=int, default=30, help="animation interval in ms"
     )
@@ -549,13 +667,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         background_speed=args.background_speed,
         background_ink_rate=args.background_ink_rate,
         obstacle=not args.no_obstacle,
-        obstacle_radius_fraction=args.obstacle_radius,
+        airfoil_length_fraction=args.airfoil_length,
+        airfoil_thickness_fraction=args.airfoil_thickness,
+        airfoil_angle_degrees=args.airfoil_angle,
     )
     app = SwirlApp(
         StableFluid2D(config),
-        force_scale=args.force_scale,
-        ink_amount=args.ink_amount,
-        brush_radius=args.brush_radius,
+        interaction_strength=args.interaction_strength,
         interval_ms=args.interval,
     )
     app.show()
