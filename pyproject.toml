@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "Interactive 2D Stable Fluids smoke and vorticity visualization"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "GPL-3.0-only"
+license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Mahdi Tude Ranjbar" }]
 dependencies = [
