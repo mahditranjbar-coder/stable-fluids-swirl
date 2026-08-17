@@ -8,8 +8,6 @@ This is an educational real-time simulation, not a validated CFD solver. The
 obstacle and open-flow boundary conditions are approximations on a collocated
 grid, so the output should not be used for engineering calculations.
 
-![Density and vorticity around the circular obstacle](docs/preview.png)
-
 ## Features
 
 - Interactive ink and velocity injection with the mouse
@@ -89,4 +87,4 @@ interpolation. Pressure and diffusion equations use Jacobi iteration.
 
 ## License
 
-MIT
+GNU General Public License v3.0 (`GPL-3.0-only`).
