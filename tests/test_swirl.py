@@ -10,7 +10,9 @@ def test_invalid_configuration_is_rejected() -> None:
     with pytest.raises(ValueError):
         SimulationConfig(dt=0.0)
     with pytest.raises(ValueError):
-        SimulationConfig(obstacle_radius_fraction=0.5)
+        SimulationConfig(airfoil_length_fraction=0.7)
+    with pytest.raises(ValueError):
+        SimulationConfig(airfoil_thickness_fraction=0.0)
 
 
 def test_step_is_finite_and_clears_sources() -> None:
@@ -40,6 +42,27 @@ def test_obstacle_remains_empty() -> None:
     simulation.step()
 
     assert not simulation.density[simulation.solid].any()
+    assert not simulation.u[simulation.solid].any()
+    assert not simulation.v[simulation.solid].any()
+
+
+def test_airfoil_can_move_rotate_and_push_fluid() -> None:
+    simulation = StableFluid2D(
+        SimulationConfig(grid_size=32, background_flow=False, obstacle=True)
+    )
+    original_mask = simulation.solid.copy()
+
+    simulation.set_airfoil(
+        9.0,
+        23.0,
+        angle=np.pi / 2.0,
+        velocity_x=0.7,
+        velocity_y=-0.4,
+    )
+
+    assert not np.array_equal(original_mask, simulation.solid)
+    assert simulation.airfoil_vertices().shape == (3, 2)
+    assert np.hypot(simulation.u, simulation.v).max() > 0.25
     assert not simulation.u[simulation.solid].any()
     assert not simulation.v[simulation.solid].any()
 
